@@ -1,7 +1,6 @@
 __pycache__/
 *.pyc
 .env
-music.db
 ~/.pulse_cache
 *.opus
 *.part
