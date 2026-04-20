@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from typing import Optional
 import yt_dlp, requests as req
 
-app = FastAPI(title="Pulse Music Backend", version="3.0.0")
+app = FastAPI(title="phonon Music Backend", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,13 +32,13 @@ if os.path.isdir(STATIC_DIR):
 DB_PATH = os.path.join(os.path.dirname(__file__), "music.db")
 
 # ── Audio cache ────────────────────────────────────────────────────────────────
-# Songs ≤ 10 min are cached as opus/webm files in ~/.pulse_cache so repeat
+# Songs ≤ 10 min are cached as opus/webm files in ~/.phonon_cache so repeat
 # playback is instant (served as a local file:// URL that the signed YT URL
 # redirects to, but more practically we serve it via /cache/<id> endpoint).
-CACHE_DIR = Path(os.getenv("PULSE_CACHE_DIR", Path.home() / ".pulse_cache"))
+CACHE_DIR = Path(os.getenv("phonon_CACHE_DIR", Path.home() / ".phonon_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_MAX_DURATION_S = 600  # 10 minutes
-CACHE_MAX_SIZE_GB = float(os.getenv("PULSE_CACHE_MAX_GB", "2"))
+CACHE_MAX_SIZE_GB = float(os.getenv("phonon_CACHE_MAX_GB", "2"))
 _cache_lock = threading.Lock()
 _download_tasks: dict[str, threading.Event] = {}  # video_id -> Event (done when set)
 
@@ -1025,7 +1025,7 @@ def index():
     idx = os.path.join(STATIC_DIR, "index.html")
     if os.path.isfile(idx):
         return FileResponse(idx)
-    return {"status": "ok", "service": "Pulse Music Backend v3.0"}
+    return {"status": "ok", "service": "phonon Music Backend v3.0"}
 
 
 # BUG FIX: catch-all so React Router works on direct URL loads
