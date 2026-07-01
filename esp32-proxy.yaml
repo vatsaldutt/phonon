@@ -1,0 +1,55 @@
+# esp32-proxy.yaml
+# Flash this to your ESP32 to make it a BLE advertising proxy.
+# It connects to your WiFi and acts as the radio between
+# Home Assistant and the fan. No code changes needed after this.
+#
+# Before flashing, fill in secrets.yaml with your actual values.
+
+esphome:
+  name: fan-ble-proxy
+  friendly_name: Fan BLE Proxy
+
+esp32:
+  board: esp32dev        # works for most common DevKit V1 boards
+  framework:
+    type: esp-idf        # required for ble_adv_proxy stability
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback hotspot if WiFi connection fails — lets you still access
+  # the ESP32 to fix credentials without re-flashing via USB
+  ap:
+    ssid: "Fan-Proxy Fallback"
+    password: "fanproxy1"
+
+captive_portal:
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+  # Required by ble_adv_proxy since ESPHome 2025.7.0
+  custom_services: true
+  homeassistant_services: true
+
+ota:
+  - platform: esphome
+
+# Scanning so HA can also see what the fan is advertising back
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+bluetooth_proxy:
+  active: true
+
+# This is the piece that enables raw BLE advertising (what the fan needs).
+# Standard bluetooth_proxy only supports GATT connections; ble_adv_proxy
+# adds the raw advertising layer on top.
+external_components:
+  - source: github://NicoIIT/esphome-ble_adv_proxy
+
+ble_adv_proxy:
+  use_max_tx_power: true   # increases range; remove only if you get build errors

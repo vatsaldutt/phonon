@@ -1,0 +1,25 @@
+services:
+  homeassistant:
+    container_name: homeassistant
+    image: ghcr.io/home-assistant/home-assistant:stable
+    restart: unless-stopped
+
+    # Required for Bluetooth + mDNS device discovery to work at all.
+    network_mode: host
+
+    # Gives the container the permissions it needs to manage the host's
+    # Bluetooth adapter via BlueZ. If you'd rather avoid full --privileged,
+    # you can instead use `cap_add: [NET_ADMIN, NET_RAW]` -- try privileged
+    # first since it's simpler, and lock it down later once things work.
+    privileged: true
+
+    volumes:
+      - ./config:/config
+      - /etc/localtime:/etc/localtime:ro
+      # The host must already have BlueZ installed and running (most Linux
+      # systems do by default). If your D-Bus socket lives at /var/run/dbus
+      # instead of /run/dbus, change the left side of this line to match.
+      - /run/dbus:/run/dbus:ro
+
+# After `docker compose up -d`, open http://localhost:8123 and complete
+# the onboarding wizard. See SETUP.md for everything after that.

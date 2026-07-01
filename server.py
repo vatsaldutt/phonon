@@ -17,6 +17,7 @@ import time as _time
 import uuid
 from pathlib import Path
 from typing import Optional
+from fan_router import router as fan_router
 
 import yt_dlp
 import requests as req
@@ -34,6 +35,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(fan_router)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 if os.path.isdir(STATIC_DIR):

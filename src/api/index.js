@@ -1,4 +1,4 @@
-const BASE = '';
+const BASE = 'https://api.vatsaldutt.com';
 
 export async function searchTracks(q, limit = 15) {
     const r = await fetch(`${BASE}/search?q=${encodeURIComponent(q)}&limit=${limit}`);
