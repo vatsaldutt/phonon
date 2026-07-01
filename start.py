@@ -13,6 +13,7 @@ Ctrl+C shuts all three down cleanly.
 
 Required env vars (add to ~/.bashrc so you don't re-export every time):
     HA_TOKEN      — Home Assistant long-lived access token
+    HA_URL        — Home Assistant URL, normally http://localhost:8123
     FAN_ENTITY    — e.g. fan.ceiling_fan
     LIGHT_ENTITY  — e.g. light.ceiling_fan_light
     SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, LASTFM_API_KEY  (music backend)
@@ -42,6 +43,7 @@ from pathlib import Path
 API_HOST   = os.environ.get("API_HOST", "0.0.0.0")
 API_PORT   = os.environ.get("API_PORT", "8000")
 API_MODULE = os.environ.get("API_MODULE", "server:app")
+HA_URL     = os.environ.get("HA_URL", "http://localhost:8123").rstrip("/")
 HA_VENV    = Path(os.environ.get("HA_VENV", Path.home() / "homeassistant")).expanduser()
 HASS_DELAY = int(os.environ.get("HASS_DELAY_S", "8"))
 
@@ -150,6 +152,11 @@ def preflight():
         log("launcher", "cloudflared: found ✓")
 
     # Warn about missing fan env vars
+    log("launcher", f"Home Assistant URL for fan API: {HA_URL}")
+    if "api.vatsaldutt.com" in HA_URL:
+        log("launcher", "WARNING: HA_URL points at the public API domain.")
+        log("launcher", "         The fan backend normally needs Home Assistant directly, e.g. http://localhost:8123")
+
     for var in ("HA_TOKEN", "FAN_ENTITY", "LIGHT_ENTITY"):
         if not os.environ.get(var):
             log("launcher", f"WARNING: {var} not set — fan endpoints will return 503")

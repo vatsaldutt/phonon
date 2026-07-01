@@ -20,8 +20,8 @@ from typing import Any
 import requests
 
 HA_URL = os.environ.get("HA_URL", "http://localhost:8123").rstrip("/")
-FAN_ENTITY = "fan.vatsal_s_ceiling_fan_main_fan"
-LIGHT_ENTITY = "light.vatsal_s_ceiling_fan_main_light"
+FAN_ENTITY = os.environ.get("FAN_ENTITY", "fan.vatsal_s_ceiling_fan_main_fan")
+LIGHT_ENTITY = os.environ.get("LIGHT_ENTITY", "light.vatsal_s_ceiling_fan_main_light")
 
 # Session is built lazily on first call so that importing this module
 # never crashes when HA_TOKEN hasn't been exported yet at import time.
@@ -31,7 +31,7 @@ _session: requests.Session | None = None
 def _get_session() -> requests.Session:
     global _session
     if _session is None:
-        token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlOGU1OTQ1ZjU4MzE0NWYxYjJkM2I4NzI3YTFiYjZjZSIsImlhdCI6MTc4MjkxNTgzNSwiZXhwIjoyMDk4Mjc1ODM1fQ.yM4ZwuJB10eHmHHzlzhEMMiRKGYqtZE8WCtoZ1RecBc"
+        token = os.environ.get("HA_TOKEN")
         if not token:
             raise RuntimeError(
                 "HA_TOKEN environment variable is not set. "
