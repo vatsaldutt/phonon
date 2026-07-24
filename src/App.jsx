@@ -189,7 +189,7 @@ export default function App() {
     return (
         <>
             <header className="header">
-                <div className="logo">Phonon <em>CRYSTAL</em></div>
+                <div className="logo">CRYSTAL <em>Music</em></div>
                 <div className="search-wrap">
                     <input
                         type="text"

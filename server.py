@@ -1,14 +1,19 @@
 """
-Music Backend Server — FastAPI v3.0
-- Spotify Web API for search (better results, real artist names)
-- Last.fm for related tracks + personalised suggestions
-- yt-dlp for audio streaming (YouTube as transport only)
+CRYSTAL Music Backend Server — FastAPI v3.1
+- yt-dlp (YouTube Music, falling back to YouTube) for search + streaming
 - Bird Feeder Camera endpoints (plug-and-play, no env vars needed)
-- All v2 bugs fixed
+- Local play-history based suggestions
+
+NOTE — Spotify Web API and Last.fm integrations have been removed.
+Both were unreliable in this deployment (expired/missing credentials caused
+constant fallback-chain failures) and have been deleted rather than left
+half-wired. The endpoints they powered (/related, and the "similar songs"
+tier of /suggestions) now return an honest empty/placeholder result instead
+of silently failing. See the "TODO: recommendation source" markers below
+for exactly where a future integration plugs back in.
 """
 
 import asyncio
-import hashlib
 import os
 import re
 import sqlite3
@@ -20,14 +25,13 @@ from typing import Optional
 from fan_router import router as fan_router
 
 import yt_dlp
-import requests as req
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="phonon Music Backend", version="3.0.0")
+app = FastAPI(title="CRYSTAL Music Backend", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,10 +49,10 @@ if os.path.isdir(STATIC_DIR):
 DB_PATH = os.path.join(os.path.dirname(__file__), "music.db")
 
 # ── Audio cache ────────────────────────────────────────────────────────────────
-CACHE_DIR = Path(os.getenv("phonon_CACHE_DIR", Path.home() / ".phonon_cache"))
+CACHE_DIR = Path(os.getenv("CRYSTAL_CACHE_DIR", Path.home() / ".crystal_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_MAX_DURATION_S = 600
-CACHE_MAX_SIZE_GB = float(os.getenv("phonon_CACHE_MAX_GB", "2"))
+CACHE_MAX_SIZE_GB = float(os.getenv("CRYSTAL_CACHE_MAX_GB", "2"))
 _cache_lock = threading.Lock()
 _download_tasks: dict[str, threading.Event] = {}
 
@@ -75,7 +79,7 @@ def _prune_cache():
         pass
 
 
-def _download_to_cache(yt_id: str, stream_url: str, duration: int | None):
+def _download_to_cache(yt_id: str, duration: int | None):
     if _cache_exists(yt_id):
         return
     if duration and duration > CACHE_MAX_DURATION_S:
@@ -122,17 +126,13 @@ def _download_to_cache(yt_id: str, stream_url: str, duration: int | None):
     t.start()
 
 
-# ── API credentials ────────────────────────────────────────────────────────────
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
-
 # ── Database ───────────────────────────────────────────────────────────────────
 
 
 def get_db():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
@@ -155,7 +155,8 @@ def init_db():
             duration INTEGER,
             position INTEGER,
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (playlist_id) REFERENCES playlists(id)
+            FOREIGN KEY (playlist_id) REFERENCES playlists(id),
+            UNIQUE (playlist_id, track_id)
         );
         CREATE TABLE IF NOT EXISTS history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,188 +178,72 @@ def init_db():
     """
     )
     con.commit()
+
+    # ── Migration: dedupe + add UNIQUE(playlist_id, track_id) on upgrade ────────
+    # A pre-existing music.db (built before this fix) may already contain
+    # duplicate rows for the same (playlist_id, track_id) pair — that's the
+    # exact bug this rewrite closes. If the table above already existed
+    # without the UNIQUE constraint, SQLite's CREATE TABLE IF NOT EXISTS
+    # silently no-ops and the constraint never gets applied. Detect that,
+    # remove existing duplicates (keeping the earliest-added row and
+    # renumbering positions), then rebuild the table with the constraint.
+    has_unique = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND sql LIKE "
+        "'%UNIQUE%playlist_id%track_id%' AND tbl_name='playlist_tracks'"
+    ).fetchone()
+    if not has_unique:
+        dupes = con.execute(
+            """
+            SELECT playlist_id, track_id, COUNT(*) c
+            FROM playlist_tracks GROUP BY playlist_id, track_id HAVING c > 1
+            """
+        ).fetchall()
+        if dupes:
+            print(f"Migrating playlist_tracks: removing duplicates for {len(dupes)} (playlist, track) pair(s)")
+            for d in dupes:
+                keep = con.execute(
+                    "SELECT MIN(id) FROM playlist_tracks WHERE playlist_id=? AND track_id=?",
+                    (d["playlist_id"], d["track_id"]),
+                ).fetchone()[0]
+                con.execute(
+                    "DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=? AND id!=?",
+                    (d["playlist_id"], d["track_id"], keep),
+                )
+            con.commit()
+        con.executescript(
+            """
+            CREATE TABLE playlist_tracks_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id TEXT,
+                track_id TEXT,
+                title TEXT,
+                artist TEXT,
+                thumbnail TEXT,
+                duration INTEGER,
+                position INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (playlist_id) REFERENCES playlists(id),
+                UNIQUE (playlist_id, track_id)
+            );
+            INSERT INTO playlist_tracks_new SELECT * FROM playlist_tracks;
+            DROP TABLE playlist_tracks;
+            ALTER TABLE playlist_tracks_new RENAME TO playlist_tracks;
+            """
+        )
+        con.commit()
+        for pid_row in con.execute("SELECT DISTINCT playlist_id FROM playlist_tracks").fetchall():
+            rows = con.execute(
+                "SELECT id FROM playlist_tracks WHERE playlist_id=? ORDER BY position, id",
+                (pid_row["playlist_id"],),
+            ).fetchall()
+            for i, r in enumerate(rows, 1):
+                con.execute("UPDATE playlist_tracks SET position=? WHERE id=?", (i, r["id"]))
+        con.commit()
+
     con.close()
 
 
 init_db()
-
-# ── Spotify ────────────────────────────────────────────────────────────────────
-
-_spotify_token: dict = {"access_token": None, "expires_at": 0}
-
-
-def _get_spotify_token() -> str | None:
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return None
-    if (
-        _spotify_token["access_token"]
-        and _time.time() < _spotify_token["expires_at"] - 30
-    ):
-        return _spotify_token["access_token"]
-    try:
-        r = req.post(
-            "https://accounts.spotify.com/api/token",
-            data={"grant_type": "client_credentials"},
-            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-            timeout=6,
-        )
-        r.raise_for_status()
-        d = r.json()
-        _spotify_token["access_token"] = d["access_token"]
-        _spotify_token["expires_at"] = _time.time() + d["expires_in"]
-        return d["access_token"]
-    except Exception:
-        return None
-
-
-def _spotify_images_to_thumb(images: list) -> str | None:
-    thumb = next((i["url"] for i in images if i.get("width", 0) >= 300), None)
-    return thumb or (images[0]["url"] if images else None)
-
-
-def _normalise_spotify_track(item: dict) -> dict:
-    artists = ", ".join(a["name"] for a in item.get("artists", []))
-    thumb = _spotify_images_to_thumb(item.get("album", {}).get("images", []))
-    return {
-        "id": item["id"],
-        "spotify_id": item["id"],
-        "title": item["name"],
-        "artist": artists,
-        "album": item.get("album", {}).get("name"),
-        "duration": item["duration_ms"] // 1000,
-        "thumbnail": thumb,
-        "popularity": item.get("popularity", 0),
-        "source": "spotify",
-    }
-
-
-def spotify_search(query: str, limit: int = 15) -> list[dict]:
-    token = _get_spotify_token()
-    if not token:
-        return []
-    try:
-        r = req.get(
-            "https://api.spotify.com/v1/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"q": query, "type": "track", "limit": limit, "market": "US"},
-            timeout=6,
-        )
-        r.raise_for_status()
-        return [
-            _normalise_spotify_track(i)
-            for i in r.json().get("tracks", {}).get("items", [])
-        ]
-    except Exception:
-        return []
-
-
-def spotify_recommendations(seed_spotify_ids: list[str], limit: int = 12) -> list[dict]:
-    token = _get_spotify_token()
-    if not token or not seed_spotify_ids:
-        return []
-    try:
-        r = req.get(
-            "https://api.spotify.com/v1/recommendations",
-            headers={"Authorization": f"Bearer {token}"},
-            params={
-                "seed_tracks": ",".join(seed_spotify_ids[:5]),
-                "limit": limit,
-                "market": "US",
-            },
-            timeout=6,
-        )
-        r.raise_for_status()
-        return [_normalise_spotify_track(i) for i in r.json().get("tracks", [])]
-    except Exception:
-        return []
-
-
-def spotify_track_by_id(spotify_id: str) -> dict | None:
-    token = _get_spotify_token()
-    if not token:
-        return None
-    try:
-        r = req.get(
-            f"https://api.spotify.com/v1/tracks/{spotify_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=5,
-        )
-        r.raise_for_status()
-        return _normalise_spotify_track(r.json())
-    except Exception:
-        return None
-
-
-# ── Last.fm ────────────────────────────────────────────────────────────────────
-
-
-def lastfm(method: str, **params) -> dict:
-    r = req.get(
-        "https://ws.audioscrobbler.com/2.0/",
-        params={
-            "method": method,
-            "api_key": LASTFM_API_KEY,
-            "format": "json",
-            **params,
-        },
-        timeout=5,
-    )
-    print(r.url)
-    r.raise_for_status()
-    return r.json()
-
-
-def lastfm_similar(artist: str, title: str, limit: int = 12) -> list[dict]:
-    title = title.split("|")[0]
-    if not LASTFM_API_KEY:
-        print("Last.fm API key not configured; skipping similar tracks")
-        return []
-    try:
-        print(f"Fetching similar tracks from Last.fm for '{title}'")
-        data = lastfm("track.getSimilar", track=title, limit=limit)
-        result = [
-            {
-                "id": None,
-                "title": t["name"],
-                "artist": t["artist"]["name"],
-                "thumbnail": next(
-                    (
-                        i["#text"]
-                        for i in t.get("image", [])
-                        if i.get("size") == "large" and i.get("#text")
-                    ),
-                    None,
-                ),
-                "source": "lastfm",
-            }
-            for t in data.get("similartracks", {}).get("track", [])
-        ]
-        print(result)
-        return result
-    except Exception:
-        return []
-
-
-def lastfm_top_tracks(tag: str = "pop", limit: int = 12) -> list[dict]:
-    if not LASTFM_API_KEY:
-        return []
-    try:
-        data = lastfm("tag.getTopTracks", tag=tag, limit=limit)
-        result = [
-            {
-                "id": None,
-                "title": t["name"],
-                "artist": t["artist"]["name"],
-                "thumbnail": None,
-                "source": "lastfm",
-            }
-            for t in data.get("tracks", {}).get("track", [])
-        ]
-        print(result)
-        return result
-    except Exception:
-        return []
-
 
 # ── yt-dlp helpers ─────────────────────────────────────────────────────────────
 
@@ -410,33 +295,29 @@ def yt_get_stream(video_id: str) -> tuple[str, dict]:
     raise Exception("No stream URL found")
 
 
-def yt_fallback_search(query: str, limit: int = 15) -> list[dict]:
-    for prefix in (f"https://music.youtube.com/search?q=", None):
-        try:
-            search_query = f"ytmsearch{limit}:{query}"
-            with yt_dlp.YoutubeDL({**YDL_OPTS, "extract_flat": True}) as ydl:
-                res = ydl.extract_info(search_query, download=False)
-                entries = res.get("entries", [])
-                if entries:
-                    return [
-                        {
-                            "id": e["id"],
-                            "title": e.get("title"),
-                            "artist": _clean_channel(
-                                e.get("uploader")
-                                or e.get("channel")
-                                or e.get("artist")
-                                or ""
-                            ),
-                            "duration": e.get("duration"),
-                            "thumbnail": f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
-                            "source": "youtube_music",
-                        }
-                        for e in entries
-                        if e.get("id")
-                    ]
-        except Exception:
-            pass
+def yt_search(query: str, limit: int = 15) -> list[dict]:
+    """YouTube Music search, falling back to plain YouTube search."""
+    try:
+        with yt_dlp.YoutubeDL({**YDL_OPTS, "extract_flat": True}) as ydl:
+            res = ydl.extract_info(f"ytmsearch{limit}:{query}", download=False)
+            entries = res.get("entries", [])
+            if entries:
+                return [
+                    {
+                        "id": e["id"],
+                        "title": e.get("title"),
+                        "artist": _clean_channel(
+                            e.get("uploader") or e.get("channel") or e.get("artist") or ""
+                        ),
+                        "duration": e.get("duration"),
+                        "thumbnail": f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
+                        "source": "youtube_music",
+                    }
+                    for e in entries
+                    if e.get("id")
+                ]
+    except Exception:
+        pass
     try:
         with yt_dlp.YoutubeDL({**YDL_OPTS, "extract_flat": True}) as ydl:
             res = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
@@ -444,9 +325,7 @@ def yt_fallback_search(query: str, limit: int = 15) -> list[dict]:
                 {
                     "id": e["id"],
                     "title": e.get("title"),
-                    "artist": _clean_channel(
-                        e.get("uploader") or e.get("channel") or ""
-                    ),
+                    "artist": _clean_channel(e.get("uploader") or e.get("channel") or ""),
                     "duration": e.get("duration"),
                     "thumbnail": f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
                     "source": "youtube",
@@ -454,6 +333,31 @@ def yt_fallback_search(query: str, limit: int = 15) -> list[dict]:
                 for e in res.get("entries", [])
                 if e.get("id")
             ]
+    except Exception:
+        return []
+
+
+def yt_get_related(video_id: str, limit: int = 12) -> list[dict]:
+    """YouTube's own 'up next' / related list for a video, as a fallback
+    recommendation source now that Last.fm/Spotify are gone."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        with yt_dlp.YoutubeDL({**YDL_OPTS, "extract_flat": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            related = []
+            for e in (info.get("related_videos") or [])[:limit]:
+                if e.get("id") and e["id"] != video_id:
+                    related.append(
+                        {
+                            "id": e["id"],
+                            "title": e.get("title"),
+                            "artist": _clean_channel(e.get("uploader") or e.get("channel") or ""),
+                            "duration": e.get("duration"),
+                            "thumbnail": f"https://i.ytimg.com/vi/{e['id']}/mqdefault.jpg",
+                            "source": "youtube_related",
+                        }
+                    )
+            return related
     except Exception:
         return []
 
@@ -483,12 +387,9 @@ def mock_search(q: str, limit: int = 10) -> list[dict]:
 def search(q: str, limit: int = 15):
     if not q.strip():
         raise HTTPException(400, "Query cannot be empty")
-    results = spotify_search(q, limit)
+    results = yt_search(q, limit)
     if results:
-        return {"query": q, "results": results, "count": len(results), "source": "spotify"}
-    yt = yt_fallback_search(q, limit)
-    if yt:
-        return {"query": q, "results": yt, "count": len(yt), "source": "youtube"}
+        return {"query": q, "results": results, "count": len(results), "source": results[0]["source"]}
     fallback = mock_search(q, limit)
     return {"query": q, "results": fallback, "count": len(fallback), "source": "mock"}
 
@@ -506,25 +407,15 @@ def serve_cached(yt_id: str):
 
 @app.get("/stream/{track_id}")
 def stream(track_id: str, title: Optional[str] = None, artist: Optional[str] = None):
+    """
+    track_id is always a YouTube video ID — every result from /search comes
+    from yt-dlp, so there's no separate ID space to detect or resolve here
+    (the old Spotify-ID branch is gone along with Spotify search).
+    """
     try:
-        yt_id: str | None = None
-        resolved_title = title
-        resolved_artist = artist
-        is_spotify_id = len(track_id) == 22 and re.match(r"^[A-Za-z0-9]+$", track_id)
-        if is_spotify_id:
-            if not resolved_title:
-                sp = spotify_track_by_id(track_id)
-                if sp:
-                    resolved_title = sp["title"]
-                    resolved_artist = sp["artist"]
-            query = f"{resolved_artist or ''} {resolved_title or ''} audio".strip()
-            yt_id = yt_search_one(query)
-            if not yt_id:
-                raise HTTPException(404, "Could not find audio for this track")
-        else:
-            yt_id = track_id
+        yt_id = track_id
         if _cache_exists(yt_id):
-            print(f"Cache HIT: {yt_id} ({resolved_title})")
+            print(f"Cache HIT: {yt_id}")
             con = get_db()
             row = con.execute(
                 "SELECT title, artist, thumbnail FROM history WHERE track_id=? ORDER BY played_at DESC LIMIT 1",
@@ -533,16 +424,16 @@ def stream(track_id: str, title: Optional[str] = None, artist: Optional[str] = N
             con.close()
             return {
                 "id": track_id, "yt_id": yt_id,
-                "title": resolved_title or (row["title"] if row else None) or yt_id,
-                "artist": resolved_artist or (row["artist"] if row else None) or "",
+                "title": title or (row["title"] if row else None) or yt_id,
+                "artist": artist or (row["artist"] if row else None) or "",
                 "duration": None,
                 "stream_url": f"/cache/{yt_id}",
                 "thumbnail": row["thumbnail"] if row else None,
                 "format": "opus", "bitrate": 128, "cached": True,
             }
         stream_url, info = yt_get_stream(yt_id)
-        resolved_title = resolved_title or info.get("title")
-        resolved_artist = resolved_artist or _clean_channel(info.get("uploader") or info.get("channel") or "")
+        resolved_title = title or info.get("title")
+        resolved_artist = artist or _clean_channel(info.get("uploader") or info.get("channel") or "")
         duration = info.get("duration")
         con = get_db()
         recent = con.execute(
@@ -557,7 +448,7 @@ def stream(track_id: str, title: Optional[str] = None, artist: Optional[str] = N
             con.commit()
         con.close()
         if not duration or duration <= CACHE_MAX_DURATION_S:
-            _download_to_cache(yt_id, stream_url, duration)
+            _download_to_cache(yt_id, duration)
         return {
             "id": track_id, "yt_id": yt_id,
             "title": resolved_title, "artist": resolved_artist,
@@ -576,16 +467,14 @@ def stream(track_id: str, title: Optional[str] = None, artist: Optional[str] = N
 
 @app.get("/related/{track_id}")
 def related(track_id: str, title: Optional[str] = None, artist: Optional[str] = None):
-    results: list[dict] = []
-    source = "none"
-    results = lastfm_similar(artist, title, limit=12)
-    if results:
-        source = "lastfm"
-    if not results and artist:
-        results = spotify_search(f"{artist}", limit=10)
-        results = [r for r in results if r.get("id") != track_id][:10]
-        if results:
-            source = "spotify_artist"
+    # TODO: recommendation source. Last.fm's track.getSimilar (and the
+    # Spotify-artist-search fallback) used to power this. Both are removed.
+    # YouTube's own "related videos" list is a reasonable stand-in and is
+    # tried first below; if yt-dlp can't extract it either, this honestly
+    # returns an empty list with source="unavailable" rather than pretending
+    # to have recommendations.
+    results = yt_get_related(track_id, limit=12)
+    source = "youtube_related" if results else "unavailable"
     print(f"Related tracks for '{artist} - {title}' (ID: {track_id}): {len(results)} found via {source}")
     return {"related": results, "source": source}
 
@@ -600,31 +489,35 @@ def suggestions(limit: int = 12):
         """
         SELECT track_id, title, artist, thumbnail, COUNT(*) as plays
         FROM history GROUP BY track_id
-        ORDER BY plays DESC, MAX(played_at) DESC LIMIT 10
-        """
+        ORDER BY plays DESC, MAX(played_at) DESC LIMIT ?
+        """,
+        (limit,),
     ).fetchall()
     con.close()
-    if not rows:
-        top = lastfm_top_tracks("pop", limit)
-        return {"suggestions": top or mock_search("top hits", limit), "source": "charts"}
-    spotify_ids: list[str] = []
-    for row in rows[:5]:
-        if len(row["track_id"]) == 22 and re.match(r"^[A-Za-z0-9]+$", row["track_id"]):
-            spotify_ids.append(row["track_id"])
-        else:
-            sp = spotify_search(f"{row['artist']} {row['title']}", limit=1)
-            if sp and sp[0].get("spotify_id"):
-                spotify_ids.append(sp[0]["spotify_id"])
-    if spotify_ids:
-        recs = spotify_recommendations(spotify_ids, limit=limit)
-        if recs:
-            return {"suggestions": recs, "source": "spotify_personalised"}
+
     if rows:
-        print(f"Spotify recommendations unavailable; falling back to Last.fm for personalised suggestions based on top track '{rows[0]['artist']} - {rows[0]['title']}'")
-        sim = lastfm_similar(rows[0]["artist"] or "", rows[0]["title"] or "", limit=limit)
-        if sim:
-            return {"suggestions": sim, "source": "lastfm_personalised"}
-    return {"suggestions": [], "source": "none"}
+        # Real signal: the user's own most-played tracks. This doesn't
+        # depend on any external API and keeps working with Spotify/Last.fm
+        # removed.
+        top = [
+            {
+                "id": r["track_id"],
+                "title": r["title"],
+                "artist": r["artist"],
+                "thumbnail": r["thumbnail"],
+                "source": "history",
+            }
+            for r in rows
+        ]
+        return {"suggestions": top, "source": "history"}
+
+    # TODO: recommendation source. With no play history yet, this used to
+    # fall back to Last.fm's tag.getTopTracks (global pop charts) or a
+    # Spotify-recommendations seed. Both are removed and there is currently
+    # no working charts/discovery source, so an empty result is returned
+    # instead of the old mock-search("top hits") stand-in, which was
+    # cosmetic filler rather than a real suggestion.
+    return {"suggestions": [], "source": "unavailable"}
 
 
 # ── History ────────────────────────────────────────────────────────────────────
@@ -752,6 +645,7 @@ def get_playlist(pid: str):
     con = get_db()
     pl = con.execute("SELECT * FROM playlists WHERE id=?", (pid,)).fetchone()
     if not pl:
+        con.close()
         raise HTTPException(404, "Playlist not found")
     tracks = con.execute(
         "SELECT * FROM playlist_tracks WHERE playlist_id=? ORDER BY position", (pid,)
@@ -762,17 +656,52 @@ def get_playlist(pid: str):
 
 @app.post("/playlists/{pid}/tracks")
 def add_to_playlist(pid: str, track: TrackIn):
+    """
+    Adds a track to a playlist. If the track is already in this playlist,
+    this is a no-op that reports the existing position rather than
+    inserting a second row — playlist_tracks now has a UNIQUE(playlist_id,
+    track_id) constraint (see init_db) specifically to make this
+    unrepresentable at the DB layer, not just avoided by the API.
+
+    This was the source of the frontend "two children with the same key"
+    React warning: every id in TrackTable/PlaylistView comes straight from
+    track_id, so a duplicate DB row was a duplicate React key by
+    construction. Fixing it here (not in the frontend) fixes it for every
+    caller, including the CLI and any future client.
+    """
     con = get_db()
     if not con.execute("SELECT id FROM playlists WHERE id=?", (pid,)).fetchone():
+        con.close()
         raise HTTPException(404, "Playlist not found")
+
+    existing = con.execute(
+        "SELECT position FROM playlist_tracks WHERE playlist_id=? AND track_id=?",
+        (pid, track.id),
+    ).fetchone()
+    if existing:
+        con.close()
+        return {"status": "already_in_playlist", "position": existing["position"]}
+
     pos = con.execute(
         "SELECT COALESCE(MAX(position),0)+1 FROM playlist_tracks WHERE playlist_id=?", (pid,)
     ).fetchone()[0]
-    con.execute(
-        "INSERT INTO playlist_tracks (playlist_id,track_id,title,artist,thumbnail,duration,position) VALUES (?,?,?,?,?,?,?)",
-        (pid, track.id, track.title, track.artist, track.thumbnail, track.duration, pos),
-    )
-    con.commit()
+    try:
+        con.execute(
+            "INSERT INTO playlist_tracks (playlist_id,track_id,title,artist,thumbnail,duration,position) VALUES (?,?,?,?,?,?,?)",
+            (pid, track.id, track.title, track.artist, track.thumbnail, track.duration, pos),
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        # Race: another request inserted the same (pid, track_id) between
+        # our SELECT and this INSERT. The UNIQUE constraint caught it —
+        # report the now-existing row instead of erroring.
+        con.rollback()
+        existing = con.execute(
+            "SELECT position FROM playlist_tracks WHERE playlist_id=? AND track_id=?",
+            (pid, track.id),
+        ).fetchone()
+        con.close()
+        return {"status": "already_in_playlist", "position": existing["position"] if existing else pos}
     con.close()
     return {"status": "added", "position": pos}
 
@@ -781,6 +710,7 @@ def add_to_playlist(pid: str, track: TrackIn):
 def remove_from_playlist(pid: str, track_id: str):
     con = get_db()
     if not con.execute("SELECT id FROM playlists WHERE id=?", (pid,)).fetchone():
+        con.close()
         raise HTTPException(404, "Playlist not found")
     con.execute(
         "DELETE FROM playlist_tracks WHERE playlist_id=? AND track_id=?", (pid, track_id)
@@ -809,6 +739,7 @@ def clear_playlist(pid: str):
 def rename_playlist(pid: str, body: PlaylistIn):
     con = get_db()
     if not con.execute("SELECT id FROM playlists WHERE id=?", (pid,)).fetchone():
+        con.close()
         raise HTTPException(404, "Playlist not found")
     con.execute("UPDATE playlists SET name=? WHERE id=?", (body.name, pid))
     con.commit()
@@ -831,7 +762,7 @@ def delete_playlist(pid: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "spotify": bool(SPOTIFY_CLIENT_ID), "lastfm": bool(LASTFM_API_KEY)}
+    return {"status": "ok"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1231,7 +1162,7 @@ def index():
     idx = os.path.join(STATIC_DIR, "index.html")
     if os.path.isfile(idx):
         return FileResponse(idx)
-    return {"status": "ok", "service": "phonon Music Backend v3.0"}
+    return {"status": "ok", "service": "CRYSTAL Music Backend v3.1"}
 
 
 @app.get("/{full_path:path}")
