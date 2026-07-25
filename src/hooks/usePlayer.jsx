@@ -140,13 +140,38 @@ export function usePlayer() {
 
             const data = await api.getStream(track);
 
-            // Discard stale responses if a newer play was requested
+            // Discard stale responses if a newer play was requested while
+            // the network call above was in flight.
             if (requestId !== undefined && requestId !== playRequestIdRef.current) return null;
 
             const vol = audio.volume;
             audio.src = data.stream_url;
             audio.volume = vol;
-            await audio.play();
+
+            try {
+                await audio.play();
+            } catch (playErr) {
+                // Rapid next/prev presses can reassign audio.src while a
+                // previous play() call is still pending — the browser then
+                // aborts that pending call, surfacing as NotSupportedError
+                // (or AbortError, depending on browser). If a newer request
+                // has since taken over, this is an expected, harmless
+                // side-effect of the skip — not a real playback failure —
+                // so it's discarded rather than shown to the user.
+                if (requestId !== undefined && requestId !== playRequestIdRef.current) {
+                    return null;
+                }
+                throw playErr;
+            }
+
+            // Re-check after play() resolves too: a newer request may have
+            // reassigned audio.src while this play() call was in flight and
+            // still "succeeded" from this call's point of view. Without this
+            // check a slow, stale request could overwrite currentTrack with
+            // the wrong track after a faster newer request already won.
+            if (requestId !== undefined && requestId !== playRequestIdRef.current) {
+                return null;
+            }
 
             const merged = {
                 ...track,
@@ -163,8 +188,13 @@ export function usePlayer() {
             fillAutoQueue(merged);
             return merged;
         } catch (e) {
-            setIsLoading(false);
-            setPendingTrack(null);
+            // Only clear loading/pending state if this is still the active
+            // request — a stale request's failure shouldn't blow away the
+            // UI state that a newer, still-in-flight request already owns.
+            if (requestId === undefined || requestId === playRequestIdRef.current) {
+                setIsLoading(false);
+                setPendingTrack(null);
+            }
             throw e;
         }
     }, [audio, fillAutoQueue]);
@@ -185,7 +215,17 @@ export function usePlayer() {
         // Optimistic: show next track immediately in the player bar
         setPendingTrack(track);
         const rid = ++playRequestIdRef.current;
-        await _playStream(track, rid);
+        try {
+            await _playStream(track, rid);
+        } catch (e) {
+            // advanceQueue is called from onEnded (a raw audio event handler)
+            // and from skipNext (fire-and-forget via advanceQueueRef), so
+            // nothing upstream awaits or catches this. A genuine failure —
+            // as opposed to the stale-request case, which _playStream
+            // already discards internally without throwing — is logged
+            // rather than left as an unhandled rejection.
+            console.error('Failed to advance queue', e);
+        }
     }, [orderedQueue, _playStream]);
 
     const advanceQueueRef = useRef(advanceQueue);
@@ -248,7 +288,7 @@ export function usePlayer() {
                         const track = { id: prev.track_id, title: prev.title, artist: prev.artist, thumbnail: prev.thumbnail, duration: prev.duration };
                         setPendingTrack(track);
                         const rid = ++playRequestIdRef.current;
-                        _playStream(track, rid);
+                        _playStream(track, rid).catch((e) => console.error('Failed to play previous track', e));
                     }
                 } else {
                     audio.currentTime = 0;
@@ -337,7 +377,7 @@ export function usePlayer() {
                     setPendingTrack(track);
                     setProgress(0); setCurrentTime(0);
                     const rid = ++playRequestIdRef.current;
-                    _playStream(track, rid);
+                    _playStream(track, rid).catch((e) => console.error('Failed to play previous track', e));
                 }
             } else {
                 audio.currentTime = 0;

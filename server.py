@@ -113,6 +113,14 @@ def _download_to_cache(yt_id: str, duration: int | None):
             for candidate in [tmp, tmp.with_suffix(".opus"), Path(str(tmp) + ".opus")]:
                 if candidate.exists() and candidate.stat().st_size > 0:
                     candidate.rename(dest)
+                    # rename() preserves the source's original mtime, which
+                    # for a slow download is when the .part file was first
+                    # created — not when the download finished. Re-stamping
+                    # here keeps _prune_cache's LRU ordering meaningful: a
+                    # track that just finished downloading shouldn't look
+                    # older than tracks that genuinely haven't been touched
+                    # in a while.
+                    os.utime(dest, None)
                     break
             _prune_cache()
         except Exception as e:
@@ -399,10 +407,28 @@ def search(q: str, limit: int = 15):
 
 @app.get("/cache/{yt_id}")
 def serve_cached(yt_id: str):
-    p = _cache_path(yt_id)
-    if not p.exists():
+    if not _cache_exists(yt_id):
+        # Covers both "never downloaded" and "download still in progress" —
+        # _cache_exists checks size > 0, not just presence, so a file that's
+        # mid-write (renamed but not yet flushed, or still a .part) is
+        # correctly treated as not-yet-cached rather than served as an
+        # empty/truncated response.
         raise HTTPException(404, "Not cached")
-    return FileResponse(str(p), media_type="audio/ogg", headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"})
+    try:
+        p = _cache_path(yt_id)
+        os.utime(p, None)  # mark as recently used, for LRU pruning
+        return FileResponse(
+            str(p),
+            media_type="audio/ogg",
+            headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"},
+        )
+    except Exception as e:
+        # Covers the race where _prune_cache() deletes this exact file
+        # (or an I/O error occurs) between the _cache_exists check above
+        # and FileResponse actually opening it. Rapid next/prev presses
+        # make this race meaningfully more likely by triggering many
+        # concurrent /stream + /cache requests in quick succession.
+        raise HTTPException(500, f"Cache file unavailable: {e}")
 
 
 @app.get("/stream/{track_id}")
